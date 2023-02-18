@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from torchmetrics.text.rouge import ROUGEScore
+from torchmetrics import CHRFScore
 import torch 
 import os
 import torch.nn as nn
@@ -17,7 +18,10 @@ class DoctorPatientDialogueDataset(torch.utils.data.Dataset):
         # TODO 把header_section 的部分拼合早section_text
         if 'section_text' in self.data.columns:
             print('TaskA data loading....')
-            self.outputs = self.data['section_text'].apply(lambda x: x[:self.max_output_length]) 
+            self.outputs = self.data.apply(lambda x: x['section_header'] + ' ' + x['section_text'], axis=1)
+            self.outputs = self.outputs.apply(lambda x: x[:self.max_output_length])
+            
+
         else:
             print('TaskB or TaskC data loading....')
             self.outputs = self.data['note'].apply(lambda x: x[:self.max_output_length]) 
@@ -43,42 +47,53 @@ class PegasusSummarizer(pl.LightningModule):
         self.model = AutoModelForSeq2SeqLM.from_pretrained(pretrained_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
-
+        self.rouge = ROUGEScore()
+        self.chrf = CHRFScore()
+        self.learning_rate = params.learning_rate
 
     def forward(self, input_ids, attention_mask, decoder_input_ids):
-        outputs = self.model(input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids)
-        return outputs[0]
+        outputs = self.model(input_ids, attention_mask=attention_mask,labels=decoder_input_ids,output_hidden_states=True,return_dict=True)
+        return outputs.loss,outputs.logits
 
     def training_step(self, batch, batch_idx):
         input_ids, attention_mask, labels, labels_mask = batch
-        logits = self.forward(input_ids, attention_mask,labels)
-        loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+        loss,logits = self.forward(input_ids, attention_mask,labels)
+        # loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         input_ids, attention_mask, labels, labels_mask = batch
-        logits = self.forward(input_ids, attention_mask,labels)
-        loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+        loss,_ = self.forward(input_ids, attention_mask,labels)
+        # loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True,sync_dist=True)
 
         # Add the ROUGE evaluation
-
-        outputs = self.model.generate(input_ids, attention_mask=attention_mask,num_beams=5)
+        # 调整参数使得能够进行多样化的生成
+        # TODO 后期把生成的参数放到后面argument
+        outputs = self.model.generate(input_ids, attention_mask=attention_mask,num_beams=5,max_new_tokens = self.params.max_output_length,length_penalty=-1)
         generated_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         target_summaries = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-        rouge = ROUGEScore()
-        rouge_score = rouge(generated_summaries, target_summaries)
-        self.log("rouge_score", rouge_score,sync_dist=True)
-        return {'val_loss': loss, 'rouge_score': rouge_score}
+        
+        rouge_score = self.rouge(generated_summaries, target_summaries)
+        chrf_score = self.chrf(generated_summaries, target_summaries)
+        self.log("chrf_score", chrf_score,sync_dist=True, on_step=False, on_epoch=True,prog_bar=True)
+        self.log("rouge_score", rouge_score,sync_dist=True, on_step=False, on_epoch=True,prog_bar=True)
+        self.log("rougeLsum_f", rouge_score['rougeLsum_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
+        self.log("rouge1_f", rouge_score['rouge1_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
+        self.log("rouge2_f", rouge_score['rouge2_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
+
+        return {'val_loss': loss, "chrf_score":chrf_score, "rougeLsum_fmeasure":rouge_score['rougeLsum_fmeasure'],"rouge1_f":rouge_score['rouge1_fmeasure'],"rouge2_f":rouge_score['rouge2_fmeasure']}
 
     def validation_end(self, outputs):
         avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        self.log('val_loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True,sync_dist=True)
+        self.log('avg_val_loss', avg_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True,sync_dist=True)
         
-        avg_rouge = torch.stack([x['rouge_score'] for x in outputs]).mean()
-        self.log("rouge_score", avg_rouge,sync_dist=True)
-        return {'avg_val_loss': avg_loss,'rouge_score': avg_rouge}
+        # avg_rouge = torch.stack([x['rouge_score'] for x in outputs]).mean()
+        # self.log("avg_rouge_score", avg_rouge,sync_dist=True,prog_bar=True)
+        # avg_rougeLsum_fmeasure = torch.stack([x['rougeLsum_fmeasure'] for x in outputs]).mean()
+        # self.log("avg_rougeLsum_fmeasure", avg_rougeLsum_fmeasure,sync_dist=True,prog_bar=True)
+        return {'avg_val_loss': avg_loss}
 
     # def prepare_data(self):
     #     df = pd.read_csv(self.params.data_path)
@@ -107,6 +122,12 @@ class PegasusSummarizer(pl.LightningModule):
         return input_ids, attention_mask, decoder_input_ids, decoder_attention_mask
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.params.learning_rate)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+        lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=self.learning_rate*0.1, max_lr=self.learning_rate, 
+                                                     step_size_up=int(self.params.epochs*0.1), step_size_down=self.params.epochs-int(self.params.epochs*0.1),cycle_momentum=False)
+        scheduler = {'scheduler': lr_scheduler, 'interval': 'step', 'frequency': 1}
+        # return torch.optim.Adam(self.model.parameters(), lr=self.params.learning_rate)
+        return {'optimizer': optimizer,'lr_scheduler': scheduler}
+        
 
     
