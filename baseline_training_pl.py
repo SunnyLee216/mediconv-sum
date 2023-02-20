@@ -59,6 +59,8 @@ if __name__ =='__main__':
     parser.add_argument("--learning_rate", type=float, default=4e-6, help="Learning rate for the optimizer")
     parser.add_argument("--batch_size", type=int, default=3, help="batch_size")
     parser.add_argument("--gpus", type=int, default=3, help="gpus")
+    parser.add_argument("--accumulation_steps", type=int, default=4, help="gradient accumulation steps")
+
 
     parser.add_argument("--epochs", type=int, default=300, help="Number of training epochs")
     hparams = parser.parse_args()
