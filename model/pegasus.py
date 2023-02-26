@@ -86,14 +86,31 @@ class PegasusSummarizer(pl.LightningModule):
         return loss
 
     def training_step(self, batch, batch_idx):
+        opt = self.optimizers()
+        sch = self.lr_schedulers()
+        
         input_ids, attention_mask, labels, labels_mask = batch
         loss,logits = self.forward(input_ids, attention_mask,labels)
+<<<<<<< HEAD
         # loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
         if self.params.use_r_drop:
             loss2,logits2 = self.forward(input_ids, attention_mask,labels)
             ce_loss = 0.5*(loss+loss2)
             kl_loss= self.compute_kl_loss(logits, logits2,pad_mask = labels_mask)
             loss = ce_loss + self.r_factor*kl_loss
+=======
+
+        N = self.params.accumulation_steps
+
+        loss = loss / N
+        self.manual_backward(loss)
+        # accumulate gradients of N batches
+        if (batch_idx + 1) % N == 0:
+            opt.step()
+            opt.zero_grad()
+            sch.step()
+
+>>>>>>> 452993623122ecfd4e4b59ca7ade4552fd2e4423
         self.log("train_loss", loss)
         return loss
 

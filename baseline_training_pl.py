@@ -78,11 +78,16 @@ if __name__ =='__main__':
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for the optimizer")
     parser.add_argument("--batch_size", type=int, default=2, help="batch_size")
     parser.add_argument("--gpus", type=int, default=3, help="gpus")
+<<<<<<< HEAD
     parser.add_argument("--beams", type=int, default=3, help="gpus")
     parser.add_argument("--warm", type=bool, default=False, help="warm_up")
     parser.add_argument("--chrf_score", type=bool, default=False, help="chrf_score")
     parser.add_argument("--rouge_score", type=bool, default=True, help="rouge_score")
     parser.add_argument("--use_r_drop", type=bool, default=False, help="use_r_drop")
+=======
+    parser.add_argument("--accumulation_steps", type=int, default=4, help="gradient accumulation steps")
+
+>>>>>>> 452993623122ecfd4e4b59ca7ade4552fd2e4423
 
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     hparams = parser.parse_args()
