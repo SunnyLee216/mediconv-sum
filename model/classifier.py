@@ -4,16 +4,20 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Adam
 import pandas as pd
 from sklearn.metrics import accuracy_score
 class DialogDataset(Dataset):
-    def __init__(self, data_file, tokenizer):
+    def __init__(self, data_file, tokenizer,label2id=None,id2label=None):
         self.data = pd.read_csv(data_file)
         self.tokenizer = tokenizer
-        self.label2id = {}
-        for label in self.data['section_header']:
-                
-            if label not in self.label2id:
-                self.label2id[label] = len(self.label2id)
-                
-        self.id2label = {v: k for k, v in self.label2id.items()}
+        if label2id:
+            self.label2id = label2id
+            self.id2label = id2label
+        else:
+            self.label2id = {}
+            for label in self.data['section_header']:
+                    
+                if label not in self.label2id:
+                    self.label2id[label] = len(self.label2id)
+                    
+            self.id2label = {v: k for k, v in self.label2id.items()}
     def __len__(self):
         return len(self.data)
 
@@ -60,28 +64,33 @@ def train():
     model_name = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     train_dataset = DialogDataset('../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-TrainingSet.csv', tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    val_dataset = DialogDataset('../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv', tokenizer)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_dataset = DialogDataset('../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv', tokenizer,id2label=train_dataset.id2label,label2id=train_dataset.label2id)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=True)
     num_labels = len(train_dataset.label2id)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
-    optimizer =  torch.optim.AdamW (model.parameters(), lr=2e-6)
+    optimizer =  torch.optim.AdamW (model.parameters(), lr=2e-5)
+    
     weight = torch.tensor([1.0 / len(train_dataset.label2id)] * num_labels)
     criterion = torch.nn.CrossEntropyLoss(weight=weight.to(device))
     model.to(device)
 
-    for epoch in range(10):
+    for epoch in range(30):
         model.train()
+        N=4
         total_loss = 0
-        for input_ids, attention_mask, label in train_loader:
+        for i, batch in enumerate(train_loader):
+            input_ids, attention_mask, label = batch
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             label = label.to(device)
-            optimizer.zero_grad()
+            
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=label)
             loss = criterion(outputs.logits, label)
             loss.backward()
-            optimizer.step()
+            if (i + 1 )%N==0:
+                optimizer.step()
+                optimizer.zero_grad()
             total_loss += loss.item()
         print(f"Epoch {epoch}: loss={total_loss}")
         evaluate(model,val_loader)
