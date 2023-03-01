@@ -80,8 +80,8 @@ class ContrastiveFinetuner(pl.LightningModule):
         
 
     def training_step(self, batch, batch_idx):
-        opt = self.optimizers()
-        sch = self.lr_schedulers()
+        # opt = self.optimizers()
+        # sch = self.lr_schedulers()
         
         input_ids, attention_mask, labels = batch
 
@@ -92,22 +92,23 @@ class ContrastiveFinetuner(pl.LightningModule):
             self.log('contrastive_loss',loss_ce,on_step=False, on_epoch=True,prog_bar=True)
         else:
             loss =loss_ce
+
         N = self.gradient_accumulation_steps
         loss = loss / N
         self.manual_backward(loss)
-        
-        # preds = torch.argmax(logits, axis=1)
-        
 
         if (batch_idx + 1) % N == 0:
-            opt.step()
-            opt.zero_grad()
-            sch.step()
+            self.optimizers().step() 
+            self.optimizers().zero_grad()
+            
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+            return {'loss': loss}
+        else:
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+            return {'loss': loss}
 
-        # self.log('contrastive_loss',loss_ce,on_step=False, on_epoch=True)
-        self.log('train_loss', loss, on_step=True, on_epoch=True,prog_bar=True)
         
-        return loss
+        
     
     def training_epoch_end(self, outputs):
         self.optimizers().step() 
@@ -160,7 +161,7 @@ class ContrastiveFinetuner(pl.LightningModule):
         scheduler = get_linear_schedule_with_warmup(
             optimizer, num_warmup_steps=5, num_training_steps=self.params.total_steps
         )
-        return [optimizer], [scheduler]
+        return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
 
     def train_dataloader(self):
         dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size=self.params.batch_size, shuffle=True, num_workers=4)
