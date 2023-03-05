@@ -24,32 +24,29 @@ class ProtoClassifier(pl.LightningModule):
                 train_file="../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-TrainingSet.csv",
                 val_file = "../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv",
                 test_file = "../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv", 
-                num_classes=20, margin=0.5, temperature=0.5,
-                dropout_prob=0.5, N = 12,lam = 0.1,params=None):
+                num_classes=20, margin=0.5, temperature=0.5,seed=42,
+                dropout_prob=0.5, N = 12,lam = 0.1,params=None,lr_prototypes = 1e-3,lr_orthers=1e-3):
         super().__init__()
+        pl.utilities.seed.seed_everything(seed=seed)
+
+        ### PARAMETERS ###
         self.params = params
-        
-        self.dropout = nn.Dropout(dropout_prob)
-        # self.num_classes = num_classes
-        self.fc = nn.Linear(self.bert.config.hidden_size, self.num_classes)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.loss_fn = nn.CrossEntropyLoss()
         self.similarity_fn = nn.CosineSimilarity(dim=1)
         self.margin = margin
         self.temperature = torch.tensor(temperature)
-
-        self.train_dataset = DialogDataset(self.params.train_file, self.tokenizer, max_length = self.params.max_input_length)
-        self.val_dataset = DialogDataset(self.params.val_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.train_dataset.id2label,label2id=self.train_dataset.label2id)
-        self.test_dataset = DialogDataset(self.params.test_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.train_dataset.id2label,label2id=self.train_dataset.label2id)
-        
+        self.lr_prototypes = lr_prototypes
+        self.num_classes = num_classes
+        self.lr_features = self.params.learning_rate
+        self.lr_orthers = lr_orthers
         self.gradient_accumulation_steps = self.params.gc_step
         # self.automatic_optimization = False
 
-        self.lam = torch.tensor(lam)
+        self.lam = torch.tensor(lam).to(self.device)
         self.batch_f1 = [ ]
         self.batch_recall = []
         self.batch_acc = []
-        
+        self.num_proto_per_class = 1
         self.mlr = MulticlassRecall(num_classes=self.num_classes,  average='macro')
         self.contrastive_loss_set = params.constrast
         self.examples_for_contrastive = []
@@ -57,116 +54,118 @@ class ProtoClassifier(pl.LightningModule):
         ##### MODEL #####
         self.model_name = self.params.model_name
         self.bert = AutoModel.from_pretrained(self.model_name,output_hidden_states=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
         embedding_size = 128
         self.embedding_size = embedding_size
         self.n_classes = num_classes
         
         
-        self.encoder = nn.Sequential(
-            nn.Linear(in_features=768, out_features=self.embedding_size),
-            
-        )
-        self.prototypes = nn.Parameter(torch.randn(self.n_classes, self.embedding_size))
+        self.encoder = nn.Linear(in_features=768, out_features=self.embedding_size)
+        self.prototype_vectors = nn.Parameter(torch.randn(self.n_classes, self.embedding_size),requires_grad=True)
+
+         #### DATA LODADER ####
+        self.train_dataset = DialogDataset(self.params.train_file, self.tokenizer, max_length = self.params.max_input_length)
+        self.val_dataset = DialogDataset(self.params.val_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.train_dataset.id2label,label2id=self.train_dataset.label2id)
+        self.test_dataset = DialogDataset(self.params.test_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.train_dataset.id2label,label2id=self.train_dataset.label2id)
+        self.batch_f1 = [ ]
+        self.batch_recall = [ ]
+        self.batch_acc = [ ]
+        self.misclassified_examples=[]
 
     def forward(self, input_ids, attention_mask, labels=None):
         
         outputs = self.bert(input_ids, attention_mask=attention_mask)
-        outputs = self.encoder(outputs)
-        return outputs
+        hidden_state = outputs.last_hidden_state
+        pooled_output = hidden_state[:, 0] # CLStoken
+        outputs_encoded = self.encoder(pooled_output)
+        return outputs_encoded
         
     def training_step(self, batch, batch_idx) :
         input_ids, attention_mask, labels = batch
         outputs = self.forward(input_ids, attention_mask)
-        loss_ins = self.compute_loss_ins(outputs,labels,self.temperature)
-        loss_proto = self.compute_loss_proto(self.prototypes,outputs,labels)
-        loss = loss_ins+loss_proto
+        loss_ins = self.compute_loss_ins(outputs,labels)
+        loss_proto = self.compute_loss_proto(outputs,labels)
+        loss = self.lam*loss_ins+loss_proto
         
+        self.log("loss_proto",loss_proto)
+        self.log("loss_ins",loss_ins)
         self.log("train_loss", loss)
-        return loss
+        # ,'loss_ins':loss_ins
+        return {'loss':loss,'loss_proto':loss_proto,'loss_ins':loss_ins}
     
 
-    def sim(x, y):
-        norm_x = F.normalize(x, dim=-1)
-        norm_y = F.normalize(y, dim=-1)
-        return torch.matmul(norm_x, norm_y.transpose(1,0))
+    def sim(self,x, y):
+        norm_x = F.normalize(x + 1e-8, dim=-1)
+        norm_y = F.normalize(y + 1e-8, dim=-1)
+        return torch.matmul(norm_x, norm_y.transpose(1, 0))
     
 
-    def compute_loss_ins(self,v_ins, labels, temperature):
+    def compute_loss_ins(self,v_ins, labels):
         """
         Compute the instance-instance loss.
 
         Args:
             embeddings: tensor of shape (batch_size, embedding_dim)
-            targets: tensor of shape (batch_size,) containing target labels
+            labels: tensor of shape (batch_size,) containing target labels
             temperature: temperature parameter for the softmax function
 
         Returns:
             instance_instance_loss: instance-instance loss value
         """    
-    
-        # Compute the log probabilities for each pair of instances
-        # similarities = cosine_similarity(embeddings) / temperature  # (batch_size, batch_size)
-        # similarities = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)/ temperature
+        similarities = self.sim(v_ins,v_ins)
+        # print(similarities)
+         # (batch_size, batch_size)
+        
+        mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()  # (batch_size, batch_size)
+        mask -= torch.eye(mask.shape[0]).to(self.device)  # remove diagonal elements
+        numerator = torch.exp(similarities) * mask
+        denominator = torch.sum(torch.exp(similarities) * (1 - mask), dim=1)
+        numerator = torch.clamp(numerator, min=1e-8)
+        denominator = torch.clamp(denominator, min=1e-8)
+        # print(numerator)
+        # print(denominator)
+        #print(torch.log(numerator / denominator))
+        instance_instance_loss = -torch.mean(torch.log(numerator / denominator))
+        # print("instance_loss",instance_instance_loss)
 
-        # mask = (targets.unsqueeze(0) == targets.unsqueeze(1)).float()  # (batch_size, batch_size)
-        # mask -= torch.eye(mask.shape[0]).to(embeddings.device)  # remove diagonal elements
-        # numerator = torch.exp(similarities) * mask
-        # denominator = torch.sum(torch.exp(similarities) * (1 - mask), dim=1)
-        # instance_instance_loss = -torch.mean(torch.log(numerator / denominator))
-        num_instances = v_ins.shape[0]
-        num_classes = self.num_classes
-
-        loss = 0.
-        for n in range(num_classes):
-            # select instances of class n
-            mask = torch.eq(labels, n)
-            v_n = v_ins[mask]
-
-            # calculate similarity matrix between instances of class n
-            sim_mat = torch.exp(self.sim(v_n, v_n))
-
-            # calculate loss
-            pos_score = torch.diagonal(sim_mat)
-            neg_score = sim_mat.sum(dim=1) - pos_score
-            loss += -torch.log(pos_score / (pos_score + neg_score)).sum()
-
-        loss /= (num_instances * num_classes * (num_instances - num_classes))
-
-        return loss
+        return instance_instance_loss
         
     
     def compute_loss_proto(self, v_ins, labels):
         '''TO compute the loss between instances and proto which have the same class'''
         
     # instance-prototype loss
-
+        batch_size = v_ins.size(0)
         num_instances = v_ins.shape[0]
         num_classes = self.num_classes
-
+        
         # calculate similarity matrix between instances and prototypes
-        sim_mat = torch.exp(self.sim(v_ins, self.proto))
-
-        loss = 0.
-        for n in range(num_classes):
-            # select instances of class n
-            mask = torch.eq(labels, n)
-            v_n = v_ins[mask]
-
-            # calculate loss
-            pos_score = sim_mat[mask, n].squeeze()
-            neg_score = sim_mat.sum(dim=1) - pos_score
-            loss += -torch.log(pos_score / (pos_score + neg_score)).sum()
-
-        loss /= (num_instances * num_classes)
-
+        similarities = torch.exp(self.sim(v_ins, self.prototype_vectors))
+        #print(similarities)
+        
+         # create a mask to ignore similarities between feature and its own prototype
+        mask = torch.ones(batch_size, num_classes).to(self.device)
+        mask[torch.arange(batch_size), labels] = 0
+       
+        # calculate denominator by summing over all classes except the true class of each instance
+        denominator = torch.sum(torch.exp(similarities) * mask, dim=1, keepdim=True)
+        
+        # calculate numerator by taking the similarity between each feature and its own prototype
+        numerator = similarities[torch.arange(batch_size), labels].view(-1, 1)
+        
+        # calculate the instance-prototype loss using log-softmax
+        loss = -torch.mean(torch.log(numerator / denominator))
+        # print("proto_loss",loss)
         return loss
     
     def predict(self, query):
-        sim_scores = self.sim(query, self.proto)
+        sim_scores = self.sim(query, self.prototype_vectors)
         class_scores = []
         for i in range(self.num_classes):
             class_protos = sim_scores[:, i*self.num_proto_per_class: (i+1)*self.num_proto_per_class]
             class_scores.append(torch.mean(class_protos, dim=1))
+        class_scores = torch.stack(class_scores, dim=1)  # Convert list to tensor
         class_scores = torch.softmax(class_scores,dim=1)
         class_index = torch.argmax(class_scores, dim=1)
         return class_index
@@ -204,6 +203,7 @@ class ProtoClassifier(pl.LightningModule):
 
 
     def validation_epoch_end(self,outputs): 
+        print(self.prototype_vectors)
         avg_f1 = torch.tensor(self.batch_f1).mean()
         if avg_f1>=0.7:
             if self.misclassified_examples:
@@ -232,11 +232,22 @@ class ProtoClassifier(pl.LightningModule):
     
     def configure_optimizers(self):
         ## TODO
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.params.learning_rate)
+        joint_optimizer_specs = [{'params': self.bert.parameters(), 'lr': self.lr_features},
+                                 {'params': self.encoder.parameters(), 'lr': self.lr_orthers},
+                                {'params': self.prototype_vectors, 'lr': self.lr_prototypes},
+                                
+                                 ]
+        
+        optimizer = torch.optim.AdamW(joint_optimizer_specs)
         scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=0, num_training_steps=self.params.total_steps
+            optimizer, num_warmup_steps=5, num_training_steps=self.params.total_steps
         )
-        return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
+        return [optimizer], [scheduler]
+    
+
+
+
+
     def train_dataloader(self):
         dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size=self.params.batch_size, shuffle=True, num_workers=4)
         return dataloader
