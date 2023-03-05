@@ -24,7 +24,7 @@ class ProtoClassifier(pl.LightningModule):
                 train_file="../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-TrainingSet.csv",
                 val_file = "../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv",
                 test_file = "../MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv", 
-                num_classes=20, margin=0.5, temperature=0.5,seed=42,
+                num_classes=20, margin=0.5, temperature=0.5,seed=42,use_attention=False,
                 dropout_prob=0.5, N = 12,lam = 0.1,params=None,lr_prototypes = 1e-3,lr_orthers=1e-3):
         super().__init__()
         pl.utilities.seed.seed_everything(seed=seed)
@@ -40,6 +40,7 @@ class ProtoClassifier(pl.LightningModule):
         self.lr_features = self.params.learning_rate
         self.lr_orthers = lr_orthers
         self.gradient_accumulation_steps = self.params.gc_step
+        self.is_dia =self.params.is_dia
         # self.automatic_optimization = False
 
         self.lam = torch.tensor(lam).to(self.device)
@@ -50,7 +51,7 @@ class ProtoClassifier(pl.LightningModule):
         self.mlr = MulticlassRecall(num_classes=self.num_classes,  average='macro')
         self.contrastive_loss_set = params.constrast
         self.examples_for_contrastive = []
-
+        self.use_attention = use_attention
         ##### MODEL #####
         self.model_name = self.params.model_name
         self.bert = AutoModel.from_pretrained(self.model_name,output_hidden_states=True)
@@ -60,14 +61,18 @@ class ProtoClassifier(pl.LightningModule):
         self.embedding_size = embedding_size
         self.n_classes = num_classes
         
-        
+        self.is_cls =True  
         self.encoder = nn.Linear(in_features=768, out_features=self.embedding_size)
         self.prototype_vectors = nn.Parameter(torch.randn(self.n_classes, self.embedding_size),requires_grad=True)
-
+        if self.use_attention:
+            attention_vectors = torch.rand((self.num_classes, self.hidden_size))
+            self.attention_vectors = nn.Parameter(attention_vectors, requires_grad=True)
          #### DATA LODADER ####
-        self.train_dataset = DialogDataset(self.params.train_file, self.tokenizer, max_length = self.params.max_input_length)
-        self.val_dataset = DialogDataset(self.params.val_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.train_dataset.id2label,label2id=self.train_dataset.label2id)
-        self.test_dataset = DialogDataset(self.params.test_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.train_dataset.id2label,label2id=self.train_dataset.label2id)
+        self.train_dataset = DialogDataset(self.params.train_file, self.tokenizer, max_length = self.params.max_input_length,is_dia=self.is_dia)
+        self.id2label = self.train_dataset.id2label
+        self.label2id = self.train_dataset.label2id
+        self.val_dataset = DialogDataset(self.params.val_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.id2label , label2id=self.label2id,is_dia=self.is_dia)
+        self.test_dataset = DialogDataset(self.params.test_file, self.tokenizer, max_length = self.params.max_input_length, id2label=self.id2label , label2id=self.label2id,is_dia=self.is_dia)
         self.batch_f1 = [ ]
         self.batch_recall = [ ]
         self.batch_acc = [ ]
@@ -77,7 +82,10 @@ class ProtoClassifier(pl.LightningModule):
         
         outputs = self.bert(input_ids, attention_mask=attention_mask)
         hidden_state = outputs.last_hidden_state
-        pooled_output = hidden_state[:, 0] # CLStoken
+        if self.is_cls:
+            pooled_output = hidden_state[:, 0] # CLStoken
+        else:
+            pooled_output = hidden_state.mean(dim=1)
         outputs_encoded = self.encoder(pooled_output)
         return outputs_encoded
         
@@ -88,9 +96,9 @@ class ProtoClassifier(pl.LightningModule):
         loss_proto = self.compute_loss_proto(outputs,labels)
         loss = self.lam*loss_ins+loss_proto
         
-        self.log("loss_proto",loss_proto)
-        self.log("loss_ins",loss_ins)
-        self.log("train_loss", loss)
+        self.log("loss_proto",loss_proto,prog_bar=True,on_step=True, sync_dist=True)
+        self.log("loss_ins",loss_ins,prog_bar=True,on_step=True, sync_dist=True)
+        self.log("train_loss", loss,prog_bar=True,on_step=True, sync_dist=True)
         # ,'loss_ins':loss_ins
         return {'loss':loss,'loss_proto':loss_proto,'loss_ins':loss_ins}
     
@@ -189,9 +197,9 @@ class ProtoClassifier(pl.LightningModule):
         recall_score = self.mlr(preds=preds, target=labels)
         acc = accuracy_score(y_true=labels.cpu().numpy(), y_pred=preds.cpu().numpy())
 
-        self.log('val_acc', acc,on_epoch=True,prog_bar=True,on_step=True)
+        self.log('val_acc', acc,on_epoch=False,prog_bar=True,on_step=True, sync_dist=True)
         self.log('val_f1', f1_score, on_step=False, on_epoch=True)
-        self.log('val_recall', recall_score, on_step=False, on_epoch=True)
+        self.log('val_recall', recall_score, on_step=False, on_epoch=True, sync_dist=True)
         self.batch_f1.append(f1_score)
         self.batch_recall.append(recall_score)
         self.batch_acc.append(acc)
@@ -203,7 +211,7 @@ class ProtoClassifier(pl.LightningModule):
 
 
     def validation_epoch_end(self,outputs): 
-        print(self.prototype_vectors)
+        # print(self.prototype_vectors)
         avg_f1 = torch.tensor(self.batch_f1).mean()
         if avg_f1>=0.7:
             if self.misclassified_examples:
@@ -220,9 +228,9 @@ class ProtoClassifier(pl.LightningModule):
         # self.log("avg_rougeLsum_fmeasure", avg_rougeLsum_fmeasure,sync_dist=True,prog_bar=True)
         # 打印结果
         # self.log('avg_val_loss', avg_loss, on_epoch=True, prog_bar=True)
-        self.log('avg_val_f1', avg_f1, on_epoch=True, prog_bar=True)
-        self.log('avg_val_recall', avg_recall, on_epoch=True, prog_bar=True)
-        self.log('avg_val_acc',avg_acc, on_epoch=True,prog_bar=True)
+        self.log('avg_val_f1', avg_f1, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('avg_val_recall', avg_recall, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('avg_val_acc',avg_acc, on_epoch=True,prog_bar=True, sync_dist=True)
 
         # 清空记录的结果
         self.batch_f1 = [ ]

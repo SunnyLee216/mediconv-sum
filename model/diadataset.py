@@ -3,9 +3,10 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class DialogDataset(Dataset):
-    def __init__(self, data_file, tokenizer,label2id=None,id2label=None,max_length=512):
+    def __init__(self, data_file, tokenizer,label2id=None,id2label=None,max_length=512,is_dia=True):
         self.data = pd.read_csv(data_file)
         self.tokenizer = tokenizer
+        self.is_dia = is_dia   
         if label2id:
             self.label2id = label2id
             self.id2label = id2label
@@ -27,7 +28,10 @@ class DialogDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        text = row['dialogue']
+        if self.is_dia:
+            text = row['dialogue']
+        else:
+            text = row['section_text']
         label = row['section_header']
 
         encoding = self.tokenizer(text, padding='max_length', truncation=True, max_length=512, return_tensors='pt')
