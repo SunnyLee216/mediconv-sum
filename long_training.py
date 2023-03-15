@@ -6,13 +6,12 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 # from dataset import DoctorPatientDialogueDataset
-from transformers import AutoModel, AutoTokenizer
 from model.summarizer import Summarizer
 from model.long_summarizer import Long_Summarizer
-# from model.long_summarize_clo import Long_SummarizerClo
+from model.long_summarize_clo import Long_Summarizer_clo
 import argparse
 import warnings
-import pandas as pd
+from pytorch_lightning.strategies import DeepSpeedStrategy
 warnings.filterwarnings("ignore", message="Error loading punkt: <urlopen error [Errno 111] Connection refused>")
 # Create datasets
 
@@ -20,54 +19,54 @@ import os
 
 
 def main(hparams):
-    # pretrained_model_name = "google/pegasus-summarization"/"amagzari/pegasus-cnn_dailymail-finetuned-samsum-v2"/
-    # tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
-    # model = AutoModel.from_pretrained(model_name)
-
-    # load dataset
-    # train_dataset = DoctorPatientDialogueDataset(csv_file='./MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-TrainingSet.csv', tokenizer=tokenizer)
-
-    # val_dataset = DoctorPatientDialogueDataset(csv_file='./MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskA/TaskA-ValidationSet.csv', tokenizer=tokenizer)
-    # train_dataloader = torch.utils.data.DataLoader(train_dataset,batch_size=32,shuffle=True)
-
-    # val_dataloader = torch.utils.data.DataLoader(val_dataset,batch_size=32,shuffle=False)
     # Setting
     # Stancld/longt5-tglobal-large-16384-pubmed-3k_steps
     tb_logger = TensorBoardLogger(hparams.output_dir, name="lightning_logs")
-    checkpoint_callback = ModelCheckpoint(monitor='avg_rouge_2',
+    checkpoint_callback = ModelCheckpoint(monitor='avg_rouge_1',
                                           mode='max',
                                           save_last=True,
                                           save_top_k=1,
                                           dirpath=os.path.join(tb_logger.log_dir, 'checkpoints'),
-                                          filename='best')
-    early_stop_callback = EarlyStopping(monitor='avg_rouge_2', patience=20,mode="max")
+                                          filename='best-{epoch:02d}')
+    early_stop_callback = EarlyStopping(monitor='avg_rouge_1', patience=20,mode="max")
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
     # Summarizer or colossalai
-    model = Long_Summarizer(hparams)
-    # if hparams.strategy =="colossalai":
-    #     model = Long_SummarizerClo(hparams)
-        
-    # else:
-    #     model = Long_Summarizer(hparams)
+    if hparams.strategy=="deepspeed_stage_3_offload" or hparams.strategy=="deepspeed_stage_3":
+        model = Long_Summarizer_clo(hparams)
+    #     trainer = pl.Trainer(
+    #     accelerator="gpu",
+    #     default_root_dir=hparams.output_dir,logger=tb_logger,
+    #     callbacks=[checkpoint_callback,early_stop_callback,lr_monitor],
+    #     devices=hparams.gpus,
+    #     strategy=DeepSpeedStrategy(
+    #         stage=3,
+    #         offload_optimizer=True,
+    #         offload_parameters=True,
+    #     ),
+    #     precision=hparams.precision,
+    #     max_epochs=hparams.epochs
+    # )
+        hparams.strategy = DeepSpeedStrategy(stage=3,
+        offload_optimizer=True,
+        offload_parameters=True,)
+    else:
+        model = Long_Summarizer(hparams)
 
-    # 监控数值变化 TODO
+    
+
+    
     trainer = pl.Trainer(max_epochs=hparams.epochs,
-                      accelerator='gpu', devices=hparams.gpus,
-                      default_root_dir=hparams.output_dir,logger=tb_logger,
-                      callbacks=[checkpoint_callback,early_stop_callback,lr_monitor],
-                      strategy=hparams.strategy,
-                      accumulate_grad_batches=hparams.accumulation_steps,
-                      precision=hparams.precision,
-                      
-                      )
-    # trainer = pl.Trainer(max_epochs=hparams.epochs,
-    #                   devices=None,
-    #                   default_root_dir=hparams.output_dir,logger=tb_logger,
-    #                   callbacks=[checkpoint_callback,early_stop_callback,lr_monitor]
-    #                   )
+                    accelerator='gpu', devices=hparams.gpus,
+                    default_root_dir=hparams.output_dir,logger=tb_logger,
+                    callbacks=[checkpoint_callback,early_stop_callback,lr_monitor],
+                    strategy=hparams.strategy,
+                    accumulate_grad_batches=hparams.accumulation_steps,
+                    precision=hparams.precision,
+                    
+                    )
+#     
 
-    #trainer.tune(model)
     trainer.fit(model)
     # result = trainer.test(ckpt_path=os.path.join(tb_logger.log_dir, 'checkpoints','best.ckpt'))
     
@@ -80,11 +79,17 @@ def main(hparams):
 if __name__ =='__main__':
     parser = argparse.ArgumentParser()
     # google/long-t5-tglobal-base
+    # google/long-t5-tglobal-large
+    # google/long-t5-tglobal-xl
     # Stancld/longt5-tglobal-large-16384-pubmed-3k_steps
     # google/flan-t5-base
+    # TaskA/TaskA-TrainingSet.csv
+    # TaskA/TaskA-ValidationSet.csv
+    # TaskB/taskB_training_split.csv
+    # TaskB/taskB_training_split.csv
     parser.add_argument("--train_file",type=str, default="./MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskB/taskB_training_split.csv", help="Path to the csv data training file")
     parser.add_argument("--val_file",type=str, default="./MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskB/taskB_validation_split.csv", help="Path to the csv data validation file")
-    parser.add_argument("--test_file",type=str, default="./MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskB/taskB_validation_split .csv", help="Path to the csv data validation file")
+    parser.add_argument("--test_file",type=str, default="./MEDIQA-Chat-Training-ValidationSets-Feb-10-2023/TaskB/taskB_validation_split.csv", help="Path to the csv data validation file")
     parser.add_argument("--pretrained_model",type=str, default="google/long-t5-tglobal-base", help="pretrained model and then fine-tune")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save the outputs")
 

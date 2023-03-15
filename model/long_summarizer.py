@@ -1,7 +1,6 @@
 import pytorch_lightning as pl
 from transformers import  get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 from transformers import AutoTokenizer, LongT5ForConditionalGeneration
-import torch_optimizer as optim
 from torchmetrics.text.rouge import ROUGEScore
 from torchmetrics import CHRFScore
 import torch 
@@ -10,7 +9,8 @@ import torch.nn as nn
 import pandas as pd
 import warnings
 import torch.nn.functional as F
-import csv
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+
 warnings.filterwarnings("ignore", message="Error loading .*: <urlopen error [Errno 111] Connection refused>")
 
 
@@ -24,6 +24,8 @@ class DoctorPatientDialogueDataset(torch.utils.data.Dataset):
         self.is_split = is_split
         prompt1 = "The conversation of doctor-patient is about:"
         prompt2 = "Summarize:"
+        ## TODO ## 
+        # self.inputs = self.data.apply(lambda x: prompt1+x['section_header']+'.'+prompt2+ x['dialogue'], axis=1)
         self.inputs = self.data.apply(lambda x: prompt2+ x['dialogue'], axis=1)
         self.inputs = self.inputs.apply(lambda x: x[:self.max_input_length])
         if self.is_train:
@@ -149,11 +151,11 @@ class Long_Summarizer(pl.LightningModule):
         # TODO 后期把生成的参数放到后面argument
         if self.params.rouge_score:
             # outputs = self.model.generate(input_ids, attention_mask=attention_mask,top_p=0.95,min_length=100,max_length=4000,top_k=100,repetition_penalty=2.0)
-            outputs = self.model.generate(input_ids, attention_mask=attention_mask,top_p=0.95,min_length=1,max_length=self.params.max_output_length,top_k=100,repetition_penalty=3.0)
+            outputs = self.model.generate(input_ids, attention_mask=attention_mask,top_p=0.95,min_length=1,max_new_tokens=self.params.max_output_length,top_k=100,repetition_penalty=3.0)
             generated_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             target_summaries = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-            print("generated_summaries:",generated_summaries[:1000])
-            print("target_summaries:",target_summaries[:1000])
+            print("generated_summaries:",generated_summaries[:100])
+            print("target_summaries:",target_summaries[:100])
             rouge_score = self.rouge(generated_summaries, target_summaries)
             self.log("rouge_score", rouge_score,sync_dist=True, on_step=False, on_epoch=True,prog_bar=True)
             # self.log("rougeLsum_f", rouge_score['rougeLsum_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
@@ -184,20 +186,7 @@ class Long_Summarizer(pl.LightningModule):
         input_ids, attention_mask = batch
         
         outputs = self.model.generate(input_ids, attention_mask=attention_mask,top_p=0.95,min_length=1,max_length=self.params.max_output_length,top_k=100,repetition_penalty=3.0)
-        if self.params.rouge_score:
-            # outputs = self.model.generate(input_ids, attention_mask=attention_mask,top_p=0.95,min_length=100,max_length=4000,top_k=100,repetition_penalty=2.0)
-            outputs = self.model.generate(input_ids, attention_mask=attention_mask,top_p=0.95,min_length=1,max_length=self.params.max_output_length,top_k=100,repetition_penalty=3.0)
-            generated_summaries = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            target_summaries = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-            print("test_generated_summaries:",generated_summaries[:1000])
-            print("test_target_summaries:",target_summaries[:1000])
-            rouge_score = self.rouge(generated_summaries, target_summaries)
-            self.log("test_rouge_score", rouge_score,sync_dist=True, on_step=False, on_epoch=True,prog_bar=True)
-            # self.log("rougeLsum_f", rouge_score['rougeLsum_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
-            # self.log("rouge1_f", rouge_score['rouge1_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
-            # self.log("rouge2_f", rouge_score['rouge2_fmeasure'],sync_dist=True, on_step=False, on_epoch=True)
-            return { "test_rougeLsum_fmeasure":rouge_score['rougeLsum_fmeasure'],"rouge1_f":rouge_score['rouge1_fmeasure'],"rouge2_f":rouge_score['rouge2_fmeasure']}
-     
+        
 
         
         preds = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -249,25 +238,30 @@ class Long_Summarizer(pl.LightningModule):
 
     def configure_optimizers(self):
         #optimizer = optim.Adafactor(self.model.parameters(),lr= self.learning_rate)
-        optimizer = torch.optim.AdamW(self.trainer.model.parameters(), lr=self.learning_rate)
-
-
+        if "offload" in self.params.strategy:
+            return DeepSpeedCPUAdam(self.model.parameters(), lr=self.learning_rate)
         
-        
-        if self.warm_up:
+        else:
 
-            # scheduler = get_cosine_schedule_with_warmup(
-            # optimizer,  num_training_steps=self.params.epochs, num_warmup_steps=5
-            # )
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,  num_training_steps=self.params.epochs, num_warmup_steps=5
-            )
-            return {'optimizer': optimizer,'lr_scheduler': scheduler}
+            optimizer = torch.optim.AdamW(self.trainer.model.parameters(), lr=self.learning_rate)
+
 
             
-        else:
-            return optimizer
-        
+            
+            if self.warm_up:
+
+                # scheduler = get_cosine_schedule_with_warmup(
+                # optimizer,  num_training_steps=self.params.epochs, num_warmup_steps=5
+                # )
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,  num_training_steps=self.params.epochs, num_warmup_steps=5
+                )
+                return {'optimizer': optimizer,'lr_scheduler': scheduler}
+
+                
+            else:
+                return optimizer
+    
         
 
     
